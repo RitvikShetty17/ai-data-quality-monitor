@@ -1,0 +1,20 @@
+# Data processing
+pandas==2.2.2
+numpy==1.26.4
+
+# Data validation
+great-expectations==0.18.19
+
+# AI layer
+anthropic==0.28.0
+
+# Dashboard
+streamlit==1.35.0
+plotly==5.22.0
+
+# Alerts
+requests==2.32.3
+
+# Utilities
+python-dotenv==1.0.1
+pytest==8.2.2

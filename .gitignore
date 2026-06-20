@@ -1,0 +1,28 @@
+# Virtual environment - never push this
+venv/
+
+# Environment variables - contains API keys, never push
+.env
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+
+# Data files - too large for GitHub
+data/
+
+# Great Expectations auto-generated files
+gx/
+.great_expectations/
+
+# Reports output
+reports/*.json
+reports/*.html
+
+# VS Code settings
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
