@@ -10,7 +10,6 @@ __pycache__/
 *.pyo
 
 # Data files - too large for GitHub
-data/
 
 # Great Expectations auto-generated files
 gx/
