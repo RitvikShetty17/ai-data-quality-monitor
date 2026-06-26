@@ -159,22 +159,303 @@ class DataProfiler:
             "key_columns_checked" : key_cols,
             "severity"            : severity
         }
-
-    # ── 4. RUN FULL PROFILE ───────────────────────────────────────────────────
-    def run_full_profile(self) -> dict:
+# ── 3a. OUTLIER DETECTOR ─────────────────────────────────────────────────
+    def get_outlier_profile(self, numeric_cols: list = None) -> dict:
         """
-        Runs all profilers and returns a single combined report dict.
-        Also saves it as a JSON file to reports/.
-        """
-        print("\n🔍 Starting data profile...\n")
+        Uses IQR (Interquartile Range) method to detect statistical outliers
+        in numeric columns.
 
-        self.profile = {
-            "overview"   : self.get_overview(),
-            "nulls"      : self.get_null_profile(),
-            "duplicates" : self.get_duplicate_profile()
+        IQR = Q3 - Q1
+        Lower fence = Q1 - 1.5 * IQR  (anything below this = outlier)
+        Upper fence = Q3 + 1.5 * IQR  (anything above this = outlier)
+
+        Parameters
+        ----------
+        numeric_cols : list of column names to check.
+                       If None, automatically picks all numeric columns.
+        """
+
+        # If no columns specified, pick all numeric ones automatically
+        if numeric_cols is None:
+            numeric_cols = self.df.select_dtypes(
+                include=["int32", "int64", "float64"]
+            ).columns.tolist()
+
+        outlier_data = {}
+
+        for col in numeric_cols:
+            series = self.df[col].dropna()  # ignore nulls for this calculation
+
+            # Calculate quartiles and IQR
+            Q1  = series.quantile(0.25)
+            Q3  = series.quantile(0.75)
+            IQR = Q3 - Q1
+
+            # Define the acceptable range
+            lower_fence = Q1 - 1.5 * IQR
+            upper_fence = Q3 + 1.5 * IQR
+
+            # Count values outside the fences
+            outliers_low  = int((series < lower_fence).sum())
+            outliers_high = int((series > upper_fence).sum())
+            total_outliers = outliers_low + outliers_high
+            outlier_pct    = round(total_outliers / len(series) * 100, 2)
+
+            # Assign severity
+            if outlier_pct == 0:
+                severity = "ok"
+            elif outlier_pct < 1:
+                severity = "warning"
+            elif outlier_pct < 5:
+                severity = "critical"
+            else:
+                severity = "severe"
+
+            outlier_data[col] = {
+                "q1"            : round(float(Q1), 4),
+                "q3"            : round(float(Q3), 4),
+                "iqr"           : round(float(IQR), 4),
+                "lower_fence"   : round(float(lower_fence), 4),
+                "upper_fence"   : round(float(upper_fence), 4),
+                "outliers_low"  : outliers_low,
+                "outliers_high" : outliers_high,
+                "total_outliers": total_outliers,
+                "outlier_pct"   : outlier_pct,
+                "actual_min"    : round(float(series.min()), 4),
+                "actual_max"    : round(float(series.max()), 4),
+                "severity"      : severity
+            }
+
+        # Summary
+        cols_with_outliers  = sum(1 for v in outlier_data.values() if v["total_outliers"] > 0)
+        cols_severe         = sum(1 for v in outlier_data.values() if v["severity"] in ("critical","severe"))
+        total_outlier_cells = sum(v["total_outliers"] for v in outlier_data.values())
+
+        print(f"\n{'='*55}")
+        print(f"  OUTLIER PROFILE (IQR method)")
+        print(f"{'='*55}")
+        print(f"  Columns checked        : {len(numeric_cols)}")
+        print(f"  Columns with outliers  : {cols_with_outliers}")
+        print(f"  Critical/severe cols   : {cols_severe}")
+        print(f"\n  {'Column':<25} {'Outliers':>10}  {'Pct':>6}  {'Severity'}")
+        print(f"  {'-'*55}")
+
+        for col, stats in outlier_data.items():
+            if stats["total_outliers"] > 0:
+                print(
+                    f"  {col:<25} {stats['total_outliers']:>10,}  "
+                    f"{stats['outlier_pct']:>5}%  {stats['severity'].upper()}"
+                )
+                # Show the actual range vs allowed range for context
+                print(
+                    f"  {'':25}  actual: [{stats['actual_min']} → {stats['actual_max']}]"
+                    f"  allowed: [{stats['lower_fence']} → {stats['upper_fence']}]"
+                )
+
+        return {
+            "summary": {
+                "columns_checked"       : len(numeric_cols),
+                "columns_with_outliers" : cols_with_outliers,
+                "columns_severe"        : cols_severe,
+                "total_outlier_cells"   : total_outlier_cells
+            },
+            "by_column": outlier_data
         }
 
-        # Save JSON report to reports/ folder
+    # ── 3b. DATA TYPE / BUSINESS RULE CHECKER ────────────────────────────────
+    def get_dtype_and_rule_profile(self) -> dict:
+        """
+        Checks dataset-specific business rules beyond just data types.
+        For NYC Taxi data these are hard domain rules — things that should
+        NEVER be true in valid data.
+
+        These rules come directly from what we discovered in our Day 2 EDA.
+        """
+
+        rules = {}
+
+        # ── Rule 1: Fare amount must be positive ─────────────────────────────
+        if "fare_amount" in self.df.columns:
+            violations = int((self.df["fare_amount"] <= 0).sum())
+            rules["fare_amount_must_be_positive"] = {
+                "column"      : "fare_amount",
+                "rule"        : "fare_amount > 0",
+                "violations"  : violations,
+                "violation_pct": round(violations / len(self.df) * 100, 2),
+                "severity"    : "ok" if violations == 0 else "critical"
+            }
+
+        # ── Rule 2: Trip distance must be non-negative ────────────────────────
+        if "trip_distance" in self.df.columns:
+            violations = int((self.df["trip_distance"] < 0).sum())
+            rules["trip_distance_non_negative"] = {
+                "column"      : "trip_distance",
+                "rule"        : "trip_distance >= 0",
+                "violations"  : violations,
+                "violation_pct": round(violations / len(self.df) * 100, 2),
+                "severity"    : "ok" if violations == 0 else "critical"
+            }
+
+        # ── Rule 3: Passenger count must be 1-6 (NYC legal limit) ────────────
+        if "passenger_count" in self.df.columns:
+            violations = int(
+                ((self.df["passenger_count"] < 1) |
+                 (self.df["passenger_count"] > 6)).sum()
+            )
+            rules["passenger_count_valid_range"] = {
+                "column"      : "passenger_count",
+                "rule"        : "1 <= passenger_count <= 6",
+                "violations"  : violations,
+                "violation_pct": round(violations / len(self.df) * 100, 2),
+                "severity"    : "ok" if violations == 0 else "warning"
+            }
+
+        # ── Rule 4: Pickup must be before dropoff ─────────────────────────────
+        if ("tpep_pickup_datetime" in self.df.columns and
+                "tpep_dropoff_datetime" in self.df.columns):
+            violations = int(
+                (self.df["tpep_pickup_datetime"] >=
+                 self.df["tpep_dropoff_datetime"]).sum()
+            )
+            rules["pickup_before_dropoff"] = {
+                "column"      : "tpep_pickup_datetime + tpep_dropoff_datetime",
+                "rule"        : "pickup_datetime < dropoff_datetime",
+                "violations"  : violations,
+                "violation_pct": round(violations / len(self.df) * 100, 2),
+                "severity"    : "ok" if violations == 0 else "critical"
+            }
+
+        # ── Rule 5: Pickup year must be 2024 (dataset should only have 2024) ──
+        if "tpep_pickup_datetime" in self.df.columns:
+            violations = int(
+                (self.df["tpep_pickup_datetime"].dt.year != 2024).sum()
+            )
+            rules["pickup_year_must_be_2024"] = {
+                "column"      : "tpep_pickup_datetime",
+                "rule"        : "year(pickup_datetime) == 2024",
+                "violations"  : violations,
+                "violation_pct": round(violations / len(self.df) * 100, 2),
+                "severity"    : "ok" if violations == 0 else "critical"
+            }
+
+        # ── Rule 6: Zero distance but positive fare (suspicious) ──────────────
+        if "trip_distance" in self.df.columns and "fare_amount" in self.df.columns:
+            violations = int(
+                ((self.df["trip_distance"] == 0) &
+                 (self.df["fare_amount"] > 0)).sum()
+            )
+            rules["zero_distance_with_fare"] = {
+                "column"      : "trip_distance + fare_amount",
+                "rule"        : "NOT (trip_distance==0 AND fare_amount>0)",
+                "violations"  : violations,
+                "violation_pct": round(violations / len(self.df) * 100, 2),
+                "severity"    : "ok" if violations == 0 else "warning"
+            }
+
+        # ── Rule 7: Total amount must equal components ─────────────────────────
+        # total = fare + extra + mta_tax + tip + tolls + improvement + congestion
+        amount_cols = [
+            "fare_amount", "extra", "mta_tax", "tip_amount",
+            "tolls_amount", "improvement_surcharge"
+        ]
+        if all(c in self.df.columns for c in amount_cols + ["total_amount"]):
+            calculated = self.df[amount_cols].sum(axis=1).round(2)
+            actual     = self.df["total_amount"].round(2)
+            # Allow $0.10 tolerance for floating point rounding
+            violations = int((abs(calculated - actual) > 0.10).sum())
+            rules["total_amount_matches_components"] = {
+                "column"      : "total_amount",
+                "rule"        : "total_amount ≈ sum of fare components (±$0.10)",
+                "violations"  : violations,
+                "violation_pct": round(violations / len(self.df) * 100, 2),
+                "severity"    : "ok" if violations == 0 else "warning"
+            }
+
+        # ── Print summary ─────────────────────────────────────────────────────
+        total_violations = sum(r["violations"] for r in rules.values())
+        rules_passed     = sum(1 for r in rules.values() if r["violations"] == 0)
+        rules_failed     = len(rules) - rules_passed
+
+        print(f"\n{'='*55}")
+        print(f"  BUSINESS RULE CHECKS")
+        print(f"{'='*55}")
+        print(f"  Rules checked  : {len(rules)}")
+        print(f"  Rules passed   : {rules_passed}")
+        print(f"  Rules failed   : {rules_failed}")
+        print(f"  Total violations: {total_violations:,}")
+        print(f"\n  {'Rule':<40} {'Violations':>12}  {'Severity'}")
+        print(f"  {'-'*60}")
+
+        for rule_name, stats in rules.items():
+            status = "✅" if stats["violations"] == 0 else "❌"
+            print(
+                f"  {status} {rule_name:<38} "
+                f"{stats['violations']:>10,}  {stats['severity'].upper()}"
+            )
+
+        return {
+            "summary": {
+                "rules_checked"    : len(rules),
+                "rules_passed"     : rules_passed,
+                "rules_failed"     : rules_failed,
+                "total_violations" : total_violations
+            },
+            "by_rule": rules
+        }
+    # ── 4. RUN FULL PROFILE ───────────────────────────────────────────────────
+    # ── 4. RUN FULL PROFILE ───────────────────────────────────────────────────
+    def run_full_profile(self, numeric_cols: list = None) -> dict:
+        """
+        Runs ALL profilers in sequence and saves combined JSON report.
+        This is the single method you call to get the complete picture.
+        """
+        print("\n🔍 Starting full data profile...\n")
+
+        self.profile = {
+            "overview"      : self.get_overview(),
+            "nulls"         : self.get_null_profile(),
+            "duplicates"    : self.get_duplicate_profile(),
+            "outliers"      : self.get_outlier_profile(numeric_cols),
+            "business_rules": self.get_dtype_and_rule_profile()
+        }
+
+        # Calculate an overall health score (0-100)
+        # Based on: rules passed, null severity, outlier severity
+        rules        = self.profile["business_rules"]
+        total_rules  = rules["summary"]["rules_checked"]
+        passed_rules = rules["summary"]["rules_passed"]
+        rule_score   = (passed_rules / total_rules * 100) if total_rules > 0 else 100
+
+        null_cols_ok = sum(
+            1 for v in self.profile["nulls"]["by_column"].values()
+            if v["severity"] == "ok"
+        )
+        null_score = null_cols_ok / self.profile["overview"]["column_count"] * 100
+
+        # Weighted score: 60% business rules, 40% null health
+        health_score = round(0.6 * rule_score + 0.4 * null_score, 1)
+
+        self.profile["health_score"] = {
+            "score"      : health_score,
+            "rule_score" : round(rule_score, 1),
+            "null_score" : round(null_score, 1),
+            "grade"      : (
+                "A" if health_score >= 90 else
+                "B" if health_score >= 75 else
+                "C" if health_score >= 60 else
+                "D"
+            )
+        }
+
+        print(f"\n{'='*55}")
+        print(f"  📊 OVERALL DATA HEALTH SCORE")
+        print(f"{'='*55}")
+        print(f"  Score        : {health_score} / 100")
+        print(f"  Grade        : {self.profile['health_score']['grade']}")
+        print(f"  Rule score   : {round(rule_score, 1)}%")
+        print(f"  Null score   : {round(null_score, 1)}%")
+
+        # Save JSON report
         os.makedirs("reports", exist_ok=True)
         timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
         report_path = f"reports/profile_{self.dataset_name}_{timestamp}.json"
@@ -182,8 +463,7 @@ class DataProfiler:
         with open(report_path, "w") as f:
             json.dump(self.profile, f, indent=2, default=str)
 
-        print(f"\n{'='*55}")
-        print(f"  ✅ Profile complete — saved to {report_path}")
+        print(f"\n  ✅ Full profile saved → {report_path}")
         print(f"{'='*55}\n")
 
         return self.profile
@@ -194,5 +474,12 @@ if __name__ == "__main__":
     print("Loading dataset...")
     df = pd.read_parquet("data/yellow_tripdata_2024-01.parquet")
 
+    # We only profile the most meaningful numeric columns
+    # (skipping location IDs since outlier detection on IDs is meaningless)
+    cols_to_check = [
+        "fare_amount", "trip_distance", "passenger_count",
+        "tip_amount", "tolls_amount", "total_amount", "extra"
+    ]
+
     profiler = DataProfiler(df, dataset_name="nyc_taxi_jan2024")
-    report   = profiler.run_full_profile()
+    report   = profiler.run_full_profile(numeric_cols=cols_to_check)
