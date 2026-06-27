@@ -147,9 +147,15 @@ class DataProfiler:
         print(f"  Key-column dupes      : {key_dupes:,}  ({key_dupe_pct}%)")
         print(f"  Key columns used      : {key_cols}")
 
-        severity = "ok" if full_dupes == 0 else (
-            "warning" if full_dupe_pct < 1 else "critical"
-        )
+        # New — checks both full and key-column dupes
+        if full_dupes == 0 and key_dupes == 0:
+            severity = "ok"
+        elif full_dupes == 0 and key_dupe_pct < 2:
+            severity = "warning"    # key dupes exist but under 2%
+        elif full_dupes == 0 and key_dupe_pct >= 2:
+            severity = "critical"   # significant key dupes
+        else:
+            severity = "critical"   # any full dupes = critical
 
         return {
             "full_duplicates"     : full_dupes,
@@ -353,22 +359,25 @@ class DataProfiler:
             }
 
         # ── Rule 7: Total amount must equal components ─────────────────────────
-        # total = fare + extra + mta_tax + tip + tolls + improvement + congestion
+        # NYC Taxi total = fare + extra + mta_tax + tip + tolls + 
+        #                  improvement + congestion + airport_fee
         amount_cols = [
             "fare_amount", "extra", "mta_tax", "tip_amount",
-            "tolls_amount", "improvement_surcharge"
+            "tolls_amount", "improvement_surcharge",
+            "congestion_surcharge", "Airport_fee"   # ← added these two
         ]
         if all(c in self.df.columns for c in amount_cols + ["total_amount"]):
-            calculated = self.df[amount_cols].sum(axis=1).round(2)
+            # Fill nulls with 0 for optional fee columns before summing
+            calculated = self.df[amount_cols].fillna(0).sum(axis=1).round(2)
             actual     = self.df["total_amount"].round(2)
             # Allow $0.10 tolerance for floating point rounding
             violations = int((abs(calculated - actual) > 0.10).sum())
             rules["total_amount_matches_components"] = {
-                "column"      : "total_amount",
-                "rule"        : "total_amount ≈ sum of fare components (±$0.10)",
-                "violations"  : violations,
+                "column"       : "total_amount",
+                "rule"         : "total_amount ≈ sum of all fare components (±$0.10)",
+                "violations"   : violations,
                 "violation_pct": round(violations / len(self.df) * 100, 2),
-                "severity"    : "ok" if violations == 0 else "warning"
+                "severity"     : "ok" if violations == 0 else "warning"
             }
 
         # ── Print summary ─────────────────────────────────────────────────────
