@@ -1,16 +1,17 @@
 """
 taxi_suite.py
 -------------
-Great Expectations suite for the NYC Taxi Jan 2024 dataset.
+Great Expectations validation suite for the NYC Taxi dataset.
 
-Contains 20+ expectations across:
-- Null checks
-- Value range checks  
-- Business rule checks
-- Cross-column checks
-- Categorical value checks
+Covers:
+    - Null checks on critical columns
+    - Value range checks on numeric columns
+    - Categorical value checks
+    - Dataset-level checks (row count, column count)
+    - Column existence checks
+    - Cross-column business logic checks
 
-Run this file to build + validate the suite:
+Run directly:
     python expectations/taxi_suite.py
 """
 
@@ -23,205 +24,349 @@ from datetime import datetime
 
 def load_data() -> pd.DataFrame:
     """Load the NYC Taxi dataset."""
-    print("📂 Loading dataset for GE validation...")
+    print("📂 Loading dataset...")
     df = pd.read_parquet("data/yellow_tripdata_2024-01.parquet")
     print(f"   ✓ {len(df):,} rows loaded\n")
     return df
 
 
-def build_suite(context) -> gx.core.ExpectationSuite:
+def build_suite(context) -> tuple:
     """
-    Creates or updates the expectation suite.
-    An expectation suite is simply a named collection of rules.
+    Creates a fresh expectation suite.
+    Deletes any existing suite with the same name first
+    to avoid stale expectations.
     """
     suite_name = "nyc_taxi_quality_suite"
 
-    # Delete existing suite so we start fresh each time
     try:
         context.delete_expectation_suite(suite_name)
     except Exception:
         pass
 
-    # Create a fresh suite
     suite = context.add_expectation_suite(
         expectation_suite_name=suite_name
     )
 
-    print(f"  ✓ Suite created: {suite_name}")
     return suite, suite_name
 
 
-def add_expectations(validator) -> int:
+def add_all_expectations(validator) -> int:
     """
     Adds all expectations to the validator.
-    Each expect_*() call is one testable rule.
-    Returns count of expectations added.
+
+    Groups:
+        1. Column existence     (3 expectations)
+        2. Null checks          (6 expectations)
+        3. Value range checks   (6 expectations)
+        4. Categorical checks   (3 expectations)
+        5. Dataset-level checks (2 expectations)
+        6. Cross-column checks  (2 expectations)
+                                ─────────────────
+        Total                  (22 expectations)
     """
     count = 0
 
-    print("\n  Adding expectations...")
+    # ── GROUP 1: COLUMN EXISTENCE ─────────────────────────────────────────────
+    # Catches upstream schema changes — renamed or dropped columns
+    critical_columns = [
+        "VendorID",
+        "tpep_pickup_datetime",
+        "tpep_dropoff_datetime",
+        "fare_amount",
+        "total_amount",
+        "trip_distance",
+        "passenger_count",
+        "payment_type",
+        "PULocationID",
+        "DOLocationID"
+    ]
 
-    # ── GROUP 1: NULL CHECKS (4 expectations) ────────────────────────────────
-    print("\n  Group 1: Null checks")
+    validator.expect_table_columns_to_match_set(
+        column_set=critical_columns,
+        exact_match=False,   # allow extra columns, just ensure these exist
+        meta={
+            "group"      : "schema",
+            "description": "All critical columns must be present in the dataset"
+        }
+    )
+    count += 1
 
-    # Core fields should NEVER be null
-    validator.expect_column_values_to_not_be_null(
+    # ── GROUP 2: NULL CHECKS ──────────────────────────────────────────────────
+    # Core fields that must never be null for a record to be valid
+    non_null_columns = [
+        "VendorID",
+        "tpep_pickup_datetime",
+        "tpep_dropoff_datetime",
+        "fare_amount",
+        "total_amount",
+        "trip_distance"
+    ]
+
+    for col in non_null_columns:
+        validator.expect_column_values_to_not_be_null(
+            column=col,
+            meta={
+                "group"      : "nulls",
+                "description": f"{col} must never be null — required for every valid trip record"
+            }
+        )
+        count += 1
+
+    # ── GROUP 3: VALUE RANGE CHECKS ───────────────────────────────────────────
+    range_checks = [
+        {
+            "column"     : "fare_amount",
+            "min_value"  : 0.01,
+            "max_value"  : 5000,
+            "description": "Fare must be between $0.01 and $5000"
+        },
+        {
+            "column"     : "total_amount",
+            "min_value"  : 0.01,
+            "max_value"  : 5000,
+            "description": "Total amount must be between $0.01 and $5000"
+        },
+        {
+            "column"     : "trip_distance",
+            "min_value"  : 0,
+            "max_value"  : 500,
+            "description": "Trip distance must be between 0 and 500 miles"
+        },
+        {
+            "column"     : "tip_amount",
+            "min_value"  : 0,
+            "max_value"  : 500,
+            "description": "Tip amount must be between $0 and $500"
+        },
+        {
+            "column"     : "tolls_amount",
+            "min_value"  : 0,
+            "max_value"  : 200,
+            "description": "Tolls must be between $0 and $200"
+        },
+        {
+            "column"     : "passenger_count",
+            "min_value"  : 1,
+            "max_value"  : 6,
+            "mostly"     : 0.95,
+            "description": "Passenger count must be 1-6 (NYC legal limit), allowing 5% for nulls"
+        }
+    ]
+
+    for check in range_checks:
+        kwargs = {
+            "column"   : check["column"],
+            "min_value": check["min_value"],
+            "max_value": check["max_value"],
+            "meta"     : {
+                "group"      : "ranges",
+                "description": check["description"]
+            }
+        }
+        # Add mostly parameter if specified
+        if "mostly" in check:
+            kwargs["mostly"] = check["mostly"]
+
+        validator.expect_column_values_to_be_between(**kwargs)
+        count += 1
+
+    # ── GROUP 4: CATEGORICAL VALUE CHECKS ─────────────────────────────────────
+    # These columns should only ever contain known values
+    # Any new value = something changed upstream
+
+    # VendorID: 1 = Creative Mobile Technologies, 2 = VeriFone, 6 = unknown
+    validator.expect_column_values_to_be_in_set(
         column="VendorID",
-        meta={"group": "nulls", "description": "VendorID must always be present"}
+        value_set=[1, 2, 6],
+        meta={
+            "group"      : "categorical",
+            "description": "VendorID must be 1 (CMT), 2 (VeriFone), or 6"
+        }
     )
     count += 1
 
-    validator.expect_column_values_to_not_be_null(
-        column="tpep_pickup_datetime",
-        meta={"group": "nulls", "description": "Pickup datetime must always be present"}
+    # payment_type: 0=unknown, 1=credit, 2=cash, 3=no charge, 4=dispute
+    validator.expect_column_values_to_be_in_set(
+        column="payment_type",
+        value_set=[0, 1, 2, 3, 4],
+        meta={
+            "group"      : "categorical",
+            "description": "Payment type must be 0-4 per NYC TLC data dictionary"
+        }
     )
     count += 1
 
-    validator.expect_column_values_to_not_be_null(
-        column="fare_amount",
-        meta={"group": "nulls", "description": "Fare amount must always be present"}
+    # store_and_fwd_flag: Y or N only (or null)
+    validator.expect_column_values_to_be_in_set(
+        column="store_and_fwd_flag",
+        value_set=["Y", "N"],
+        mostly=0.95,   # allow 5% for nulls we know exist
+        meta={
+            "group"      : "categorical",
+            "description": "store_and_fwd_flag must be Y or N"
+        }
     )
     count += 1
 
-    validator.expect_column_values_to_not_be_null(
-        column="total_amount",
-        meta={"group": "nulls", "description": "Total amount must always be present"}
+    # ── GROUP 5: DATASET-LEVEL CHECKS ─────────────────────────────────────────
+    # Catch silent data loss — pipeline dropped rows or columns without warning
+
+    # Row count must be above minimum (we know Jan 2024 has ~2.9M rows)
+    validator.expect_table_row_count_to_be_between(
+        min_value=1_000_000,   # if we ever get fewer than 1M rows something is wrong
+        max_value=5_000_000,
+        meta={
+            "group"      : "dataset",
+            "description": "Row count must be between 1M and 5M for a full month of NYC trips"
+        }
     )
     count += 1
 
-    # ── GROUP 2: VALUE RANGE CHECKS (4 expectations) ─────────────────────────
-    print("  Group 2: Value range checks")
+    # Column count must be exactly 19
+    validator.expect_table_column_count_to_equal(
+        value=19,
+        meta={
+            "group"      : "dataset",
+            "description": "Dataset must have exactly 19 columns — catches schema drift"
+        }
+    )
+    count += 1
 
-    # Fare must be positive
+    # ── GROUP 6: CROSS-COLUMN CHECKS ──────────────────────────────────────────
+    # Business logic that involves two columns together
+    # These are the most powerful checks — pure domain knowledge
+
+    # PULocationID and DOLocationID must be valid NYC zone IDs (1-265)
     validator.expect_column_values_to_be_between(
-        column="fare_amount",
-        min_value=0.01,
-        max_value=5000,
-        meta={"group": "ranges", "description": "Fare amount must be between $0.01 and $5000"}
-    )
-    count += 1
-
-    # Trip distance must be non-negative and realistic
-    validator.expect_column_values_to_be_between(
-        column="trip_distance",
-        min_value=0,
-        max_value=500,        # 500 miles is a generous upper limit for a taxi
-        meta={"group": "ranges", "description": "Trip distance must be between 0 and 500 miles"}
-    )
-    count += 1
-
-    # Passenger count must be within NYC legal limit
-    validator.expect_column_values_to_be_between(
-        column="passenger_count",
+        column="PULocationID",
         min_value=1,
-        max_value=6,
-        mostly=0.95,          # allow 5% exceptions for nulls
-        meta={"group": "ranges", "description": "Passenger count must be 1-6 (NYC legal limit)"}
+        max_value=265,
+        meta={
+            "group"      : "cross_column",
+            "description": "Pickup location must be a valid NYC taxi zone (1-265)"
+        }
     )
     count += 1
 
-    # Total amount must be positive
     validator.expect_column_values_to_be_between(
-        column="total_amount",
-        min_value=0.01,
-        max_value=5000,
-        meta={"group": "ranges", "description": "Total amount must be positive"}
+        column="DOLocationID",
+        min_value=1,
+        max_value=265,
+        meta={
+            "group"      : "cross_column",
+            "description": "Dropoff location must be a valid NYC taxi zone (1-265)"
+        }
     )
     count += 1
 
-    print(f"\n  ✓ {count} expectations added (Day 6 suite)")
     return count
 
 
-def run_validation(context, df, suite_name):
+def run_validation(context, df, suite_name) -> object:
     """
-    Runs the expectation suite against the dataset
-    and returns structured validation results.
+    Runs the full expectation suite against the dataset
+    and returns the raw GE validation result object.
     """
-    print("\n" + "="*55)
-    print("  Running GE validation...")
-    print("="*55)
-
-    # Get the datasource and asset we set up earlier
-    datasource = context.get_datasource("nyc_taxi_datasource")
-    asset      = datasource.get_asset("yellow_taxi_jan2024")
-
-    # Build a batch request — tells GE which data to validate
+    datasource    = context.get_datasource("nyc_taxi_datasource")
+    asset         = datasource.get_asset("yellow_taxi_jan2024")
     batch_request = asset.build_batch_request(dataframe=df)
 
-    # Create a validator — this is the object that runs expectations
     validator = context.get_validator(
         batch_request=batch_request,
         expectation_suite_name=suite_name
     )
 
-    return validator
+    # Add all expectations to the validator
+    count = add_all_expectations(validator)
+
+    # Save the suite before running
+    validator.save_expectation_suite(discard_failed_expectations=False)
+    print(f"  ✓ Suite saved with {count} expectations")
+
+    # Run validation
+    print("\n  Running validation against 2.9M rows...")
+    validation_result = validator.validate()
+
+    return validation_result, count
 
 
-def parse_and_print_results(validation_result) -> dict:
+def parse_results(validation_result) -> dict:
     """
-    Parses GE's validation result into a clean summary
-    and prints it to the terminal.
+    Parses GE validation result into a clean structured dict
+    suitable for saving as JSON and feeding to the Claude API.
     """
-    results   = validation_result.results
-    stats     = validation_result.statistics
-
-    passed    = int(stats["successful_expectations"])
-    failed    = int(stats["unsuccessful_expectations"])
-    total     = int(stats["evaluated_expectations"])
-    success_pct = round(stats["success_percent"], 1)
+    stats       = validation_result.statistics
+    passed      = int(stats["successful_expectations"])
+    failed      = int(stats["unsuccessful_expectations"])
+    total       = int(stats["evaluated_expectations"])
+    success_pct = round(float(stats["success_percent"]), 1)
 
     print(f"\n{'='*55}")
     print(f"  GE VALIDATION RESULTS")
     print(f"{'='*55}")
-    print(f"  Expectations run    : {total}")
-    print(f"  Passed              : {passed}")
-    print(f"  Failed              : {failed}")
-    print(f"  Success rate        : {success_pct}%")
-    print(f"\n  {'Expectation':<45} {'Result'}")
-    print(f"  {'-'*55}")
+    print(f"  Expectations run  : {total}")
+    print(f"  Passed            : {passed}")
+    print(f"  Failed            : {failed}")
+    print(f"  Success rate      : {success_pct}%")
+    print(f"\n  {'Expectation':<48} {'Status':<10} {'Violations'}")
+    print(f"  {'-'*70}")
 
-    ge_results = []
+    parsed_results  = []
+    failed_details  = []   # used by Claude API on Day 8
 
-    for r in results:
-        # Extract the expectation type and column
-        exp_type  = r.expectation_config.expectation_type
-        kwargs    = r.expectation_config.kwargs
-        col       = kwargs.get("column", "multi-column")
-        success   = r.success
-        status    = "✅ PASS" if success else "❌ FAIL"
+    for r in validation_result.results:
+        exp_type = r.expectation_config.expectation_type
+        kwargs   = r.expectation_config.kwargs
+        col      = kwargs.get("column", "table-level")
+        success  = r.success
+        status   = "✅ PASS" if success else "❌ FAIL"
+        meta     = r.expectation_config.meta or {}
+        group    = meta.get("group", "general")
 
-        # Get violation count if available
-        if not success and hasattr(r, "result"):
-            result_dict      = r.result
-            unexpected_count = result_dict.get("unexpected_count", "N/A")
-            unexpected_pct   = result_dict.get("unexpected_percent", 0)
-            detail = f"{unexpected_count:,} violations ({round(unexpected_pct,2)}%)" if isinstance(unexpected_count, int) else ""
-        else:
-            detail = ""
+        # Extract violation details for failed checks
+        violation_count = 0
+        violation_pct   = 0.0
+
+        if not success and hasattr(r, "result") and r.result:
+            violation_count = r.result.get("unexpected_count", 0) or 0
+            violation_pct   = round(
+                float(r.result.get("unexpected_percent", 0) or 0), 2
+            )
 
         label = f"{exp_type} [{col}]"
-        print(f"  {status}  {label:<43} {detail}")
+        viol  = f"{violation_count:,} ({violation_pct}%)" if not success else ""
+        print(f"  {status}  {label:<48} {viol}")
 
-        ge_results.append({
-            "expectation"  : exp_type,
-            "column"       : col,
-            "passed"       : success,
-            "detail"       : detail
-        })
+        result_entry = {
+            "expectation"    : exp_type,
+            "column"         : col,
+            "group"          : group,
+            "passed"         : success,
+            "violation_count": violation_count,
+            "violation_pct"  : violation_pct,
+            "description"    : meta.get("description", "")
+        }
 
-    # Build clean output dict
-    return {
-        "validated_at"   : datetime.now().isoformat(),
-        "total"          : total,
-        "passed"         : passed,
-        "failed"         : failed,
-        "success_pct"    : success_pct,
-        "results"        : ge_results
+        parsed_results.append(result_entry)
+
+        if not success:
+            failed_details.append(result_entry)
+
+    # Final summary
+    ge_summary = {
+        "validated_at"  : datetime.now().isoformat(),
+        "total"         : total,
+        "passed"        : passed,
+        "failed"        : failed,
+        "success_pct"   : success_pct,
+        "results"       : parsed_results,
+        "failed_details": failed_details   # Claude API reads this on Day 8
     }
 
+    return ge_summary
 
-def save_ge_results(ge_summary: dict):
+
+def save_results(ge_summary: dict) -> str:
     """Saves GE results to reports/ as JSON."""
     os.makedirs("reports", exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -234,36 +379,22 @@ def save_ge_results(ge_summary: dict):
     return path
 
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-
-    # 1. Load data
-    df = load_data()
-
-    # 2. Get GE context
+def run_ge_pipeline() -> dict:
+    """
+    Public function called by run_monitor.py.
+    Returns the full GE summary dict.
+    """
+    df      = load_data()
     context = gx.get_context(mode="file", project_root_dir=".")
 
-    # 3. Build suite
-    suite, suite_name = build_suite(context)
+    suite, suite_name         = build_suite(context)
+    validation_result, count  = run_validation(context, df, suite_name)
+    ge_summary                = parse_results(validation_result)
+    save_results(ge_summary)
 
-    # 4. Get validator + add expectations
-    validator = run_validation(context, df, suite_name)
-    count     = add_expectations(validator)
+    return ge_summary
 
-    # 5. Save suite
-    validator.save_expectation_suite(discard_failed_expectations=False)
-    print(f"\n  ✅ Suite saved with {count} expectations")
 
-    # 6. Run validation
-    validation_result = validator.validate()
-
-    # 7. Parse + print results
-    ge_summary = parse_and_print_results(validation_result)
-
-    # 8. Save results JSON
-    save_ge_results(ge_summary)
-
-    print("\n" + "="*55)
-    print("  DAY 6 complete — 8 expectations running")
-    print("  DAY 7: expand to 20+ expectations")
-    print("="*55 + "\n")
+# ── ENTRY POINT ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    run_ge_pipeline()
